@@ -130,16 +130,6 @@ class FaceNetModel(private val context: Context) {
         return FloatArray(embedding.size) { embedding[it] / norm }
     }
 
-    /**
-     * Cosine similarity between two L2-normalized embeddings = dot product.
-     */
-    fun cosineSimilarity(e1: FloatArray, e2: FloatArray): Float {
-        if (e1.size != e2.size) return 0f
-        var dot = 0f
-        for (i in e1.indices) dot += e1[i] * e2[i]
-        return dot
-    }
-
     fun close() {
         interpreter.close()
     }

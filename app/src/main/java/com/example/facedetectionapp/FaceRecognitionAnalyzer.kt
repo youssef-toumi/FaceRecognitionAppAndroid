@@ -20,14 +20,16 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.tasks.await
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicReference
 
 @ExperimentalGetImage
 class FaceRecognitionAnalyzer(
     private val faceNetModel: FaceNetModel,
+    private val livenessModel: LivenessModel?,
     private val embeddingDatabase: FaceEmbeddingDatabase,
     private val onRecognitionResults: (List<FaceRecognitionResult>) -> Unit,
-    private val onFacesDetected: (List<Face>, Int, Int) -> Unit,
     private val similarityThreshold: Float = 0.5f,
+    private val livenessThreshold: Float = 0.5f,
     private val processingInterval: Int = 4
 ) : ImageAnalysis.Analyzer {
 
@@ -35,7 +37,7 @@ class FaceRecognitionAnalyzer(
     private val faceDetector: FaceDetector = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
-            .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
+            .setContourMode(FaceDetectorOptions.CONTOUR_MODE_NONE)
             .build()
     )
 
@@ -43,6 +45,9 @@ class FaceRecognitionAnalyzer(
     private val analyzerScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var lastFpsLogTime = System.currentTimeMillis()
     private var frameCount = 0
+
+    // Store the latest liveness score (thread-safe)
+    private val latestLivenessScore = AtomicReference(1f) // default 1 (fake, but safe)
 
     override fun analyze(imageProxy: ImageProxy) {
         frameCounter++
@@ -71,7 +76,15 @@ class FaceRecognitionAnalyzer(
             val rotatedBitmap = rotateBitmap(originalBitmap, rotationDegrees)
             Log.d(TAG, "✅ Rotated bitmap: ${rotatedBitmap.width}x${rotatedBitmap.height}, rotation: $rotationDegrees°")
 
-            // Log camera resolution every 30 frames
+            // Launch liveness inference asynchronously on the full bitmap
+            val livenessJob = livenessModel?.let { model ->
+                async {
+                    val (score, _) = model.predict(rotatedBitmap)
+                    latestLivenessScore.set(score)
+                    score
+                }
+            }
+
             if (frameCounter % 30 == 0) {
                 Log.d(TAG, "📷 Camera sensor resolution: ${imageProxy.width}x${imageProxy.height}")
                 SystemInfo.logCpuFrequency()
@@ -87,9 +100,8 @@ class FaceRecognitionAnalyzer(
                     Log.d(TAG, "   First face bounding box: ${faces[0].boundingBox}")
                 }
 
-                withContext(Dispatchers.Main) {
-                    onFacesDetected(faces, rotatedBitmap.width, rotatedBitmap.height)
-                }
+                // Wait for liveness if it's still running
+                livenessJob?.await()
 
                 val results = mutableListOf<FaceRecognitionResult>()
                 for ((index, face) in faces.withIndex()) {
@@ -101,10 +113,24 @@ class FaceRecognitionAnalyzer(
                     val embedTime = (System.nanoTime() - startEmbed) / 1_000_000.0
                     Log.d(TAG, "   Cropped: ${faceCrop.width}x${faceCrop.height}, Embedding time: ${"%.2f".format(embedTime)} ms")
 
-                    val (name, similarity) = embeddingDatabase.recognize(embedding, similarityThreshold)
-                    Log.d(TAG, "   🏷️ Recognized as: '$name' (score: ${"%.3f".format(similarity)})")
+                    val livenessScore = latestLivenessScore.get()
+                    val isReal = livenessScore < livenessThreshold
+                    val (name, similarity) = if (isReal) {
+                        embeddingDatabase.recognize(embedding, similarityThreshold)
+                    } else {
+                        "Spoof" to 0f
+                    }
 
-                    results.add(FaceRecognitionResult(face.boundingBox, name, similarity))
+                    Log.d(TAG, "   🏷️ Recognized as: '$name' (score: ${"%.3f".format(similarity)}), Liveness: ${"%.2f".format(livenessScore)} (real=$isReal)")
+
+                    // Pass liveness probability to the result
+                    results.add(FaceRecognitionResult(
+                        boundingBox = face.boundingBox,
+                        name = name,
+                        similarity = similarity,
+                        isReal = isReal,
+                        livenessProbability = livenessScore
+                    ))
                 }
 
                 withContext(Dispatchers.Main) {
@@ -114,7 +140,6 @@ class FaceRecognitionAnalyzer(
                 val totalTime = (System.nanoTime() - startTotal) / 1_000_000.0
                 Log.d(TAG, "⏱️ Total frame processing time: ${"%.2f".format(totalTime)} ms")
 
-                // FPS calculation
                 frameCount++
                 val now = System.currentTimeMillis()
                 if (now - lastFpsLogTime >= 1000) {
@@ -124,7 +149,6 @@ class FaceRecognitionAnalyzer(
                     lastFpsLogTime = now
                 }
 
-                // Periodic resource logs
                 if (frameCounter % 30 == 0) {
                     SystemInfo.logMemoryUsage(TAG)
                     SystemInfo.logCpuLoad()

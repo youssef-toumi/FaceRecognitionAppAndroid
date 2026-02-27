@@ -4,12 +4,14 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.os.Bundle
+import android.text.SpannableString
+import android.text.style.ForegroundColorSpan
 import android.util.Log
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
-import androidx.annotation.OptIn
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -26,24 +28,29 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import java.io.FileNotFoundException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: PreviewView
-    private lateinit var faceContourView: FaceContourView
     private lateinit var resultTextView: TextView
     private lateinit var btnRegister: Button
     private lateinit var btnRecognize: Button
-    private lateinit var btnResetAll: Button   // <-- New button
+    private lateinit var btnResetAll: Button
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var cameraProvider: ProcessCameraProvider
     private lateinit var cameraSelector: CameraSelector
 
     private lateinit var faceNetModel: FaceNetModel
+    private var livenessModel: LivenessModel? = null
     private lateinit var embeddingDatabase: FaceEmbeddingDatabase
     private var faceRecognitionAnalyzer: FaceRecognitionAnalyzer? = null
+
+    // Stereo depth anti-spoofing (null if calibration file is missing)
+    private var stereoCalibData: StereoCalibrationData? = null
+    private var depthAntiSpoofing: DepthAntiSpoofing? = null
 
     private val faceDetector: FaceDetector = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
@@ -62,22 +69,19 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         previewView = findViewById(R.id.previewView)
-        faceContourView = findViewById(R.id.faceContourView)
         resultTextView = findViewById(R.id.resultTextView)
         btnRegister = findViewById(R.id.btnRegister)
         btnRecognize = findViewById(R.id.btnRecognize)
-        btnResetAll = findViewById(R.id.btnResetAll)   // <-- New button binding
+        btnResetAll = findViewById(R.id.btnResetAll)
 
         btnRegister.setOnClickListener { showNameInputDialog() }
         btnRecognize.setOnClickListener { switchToRecognitionMode() }
-
-        // --- RESET ALL button logic ---
         btnResetAll.setOnClickListener {
             AlertDialog.Builder(this)
                 .setTitle("Reset Database")
                 .setMessage("Delete ALL stored face embeddings?\nThis cannot be undone.")
                 .setPositiveButton("Yes") { _, _ ->
-                    embeddingDatabase.clear()   // Clears in-memory and persistent storage
+                    embeddingDatabase.clear()
                     resultTextView.text = "All faces deleted"
                     Toast.makeText(this, "✅ Database cleared", Toast.LENGTH_SHORT).show()
                     Log.d(TAG, "All embeddings cleared by user")
@@ -86,7 +90,6 @@ class MainActivity : AppCompatActivity() {
                 .show()
         }
 
-        // Log device hardware & CPU info
         SystemInfo.logDeviceInfo(this)
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -107,7 +110,70 @@ class MainActivity : AppCompatActivity() {
 
     private fun initModels() {
         faceNetModel = FaceNetModel(this)
-        embeddingDatabase = FaceEmbeddingDatabase(this) // persistent storage
+        livenessModel = try {
+            LivenessModel(this)
+        } catch (e: FileNotFoundException) {
+            Log.w(TAG, "Liveness model not found (liveness_detection_model.tflite missing). Liveness disabled.")
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load liveness model", e)
+            null
+        }
+        embeddingDatabase = FaceEmbeddingDatabase(this)
+
+        // Initialize stereo depth anti-spoofing (graceful if calibration missing)
+        initStereoDepth()
+    }
+
+    private fun initStereoDepth() {
+        try {
+            // Load OpenCV native library
+            org.opencv.android.OpenCVLoader.initLocal()
+            Log.d(TAG, "OpenCV loaded")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load OpenCV", e)
+            return
+        }
+
+        stereoCalibData = StereoCalibrationData.loadFromAssets(this)
+        if (stereoCalibData == null) {
+            Log.w(TAG, "Stereo calibration not found → depth anti-spoofing disabled")
+            Log.w(TAG, "To enable: run tools/stereo_calibrate.py, copy stereo_calib.json to assets/")
+            return
+        }
+
+        val stereoCapture = StereoCapture(this)
+        val rectifier = StereoRectifier(stereoCalibData!!)
+        val depthProcessor = StereoDepthProcessor(stereoCalibData!!)
+        depthAntiSpoofing = DepthAntiSpoofing(stereoCapture, rectifier, depthProcessor)
+        Log.d(TAG, "✅ Stereo depth anti-spoofing initialized")
+    }
+
+    /**
+     * Perform a stereo depth liveness check on a detected face.
+     * Call this from a coroutine when you want extra anti-spoofing.
+     *
+     * This pauses CameraX, captures a stereo pair, processes depth,
+     * then resumes CameraX.
+     */
+    private suspend fun performDepthLivenessCheck(
+        faceBoundingBox: android.graphics.Rect
+    ): DepthAntiSpoofing.DepthLivenessResult? {
+        val detector = depthAntiSpoofing ?: return null
+
+        // Must pause CameraX for StereoCapture (exclusive camera access)
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+            cameraProvider.unbindAll()
+        }
+
+        return try {
+            detector.checkLiveness(faceBoundingBox)
+        } finally {
+            // Always resume CameraX
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                switchToRecognitionMode()
+            }
+        }
     }
 
     private fun startCamera() {
@@ -131,19 +197,40 @@ class MainActivity : AppCompatActivity() {
     private fun createRecognitionAnalyzer(): FaceRecognitionAnalyzer {
         return FaceRecognitionAnalyzer(
             faceNetModel = faceNetModel,
+            livenessModel = livenessModel,
             embeddingDatabase = embeddingDatabase,
             onRecognitionResults = { results ->
                 if (results.isNotEmpty()) {
                     val best = results.maxByOrNull { it.similarity }
-                    resultTextView.text = "${best?.name} (${"%.2f".format(best?.similarity ?: 0f)})"
+                    val name = best?.name ?: "Unknown"
+                    val score = best?.similarity ?: 0f
+                    val isReal = best?.isReal ?: true
+                    val livenessProb = best?.livenessProbability ?: -1f
+
+                    // Invert probability to show "real confidence" (100% - probability)
+                    val confidence = if (livenessProb >= 0) (1 - livenessProb) * 100 else -1f
+
+                    val text = if (confidence >= 0) {
+                        if (isReal) {
+                            "$name (${"%.2f".format(score)}) - Confidence: ${"%.0f".format(confidence)}%"
+                        } else {
+                            "Fake - Confidence: ${"%.0f".format(confidence)}%"
+                        }
+                    } else {
+                        "$name (${"%.2f".format(score)})"
+                    }
+
+                    val spannable = SpannableString(text)
+                    val color = if (isReal) Color.GREEN else Color.RED
+                    spannable.setSpan(ForegroundColorSpan(color), 0, text.length, 0)
+
+                    resultTextView.text = spannable
                 } else {
                     resultTextView.text = "No face"
                 }
             },
-            onFacesDetected = { faces, width, height ->
-                faceContourView.updateFaces(faces, width, height)
-            },
             similarityThreshold = 0.5f,
+            livenessThreshold = 0.5f,
             processingInterval = 4
         )
     }
@@ -205,7 +292,6 @@ class MainActivity : AppCompatActivity() {
         cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis)
     }
 
-    @OptIn(ExperimentalGetImage::class)
     private fun processFrameForEnrollment(imageProxy: ImageProxy, name: String) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
@@ -294,6 +380,8 @@ class MainActivity : AppCompatActivity() {
         cameraExecutor.shutdown()
         faceRecognitionAnalyzer?.close()
         faceNetModel.close()
+        livenessModel?.close()
         faceDetector.close()
+        stereoCalibData?.release()
     }
 }
