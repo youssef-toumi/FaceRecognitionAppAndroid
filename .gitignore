@@ -13,3 +13,8 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Python tooling
+/tools/venv/
+**/__pycache__/
+*.pyc
